@@ -1,122 +1,215 @@
 # Data Model Finalization Questions
 
-Draft checklist of open questions to resolve before locking the PostgreSQL schema and provisioning the development environment. Update this doc as decisions are made.
+Open questions to resolve before locking the PostgreSQL schema and provisioning the development environment.
 
-## LucidLink Integration Updates
+---
 
-**DECISION MADE**: The system will use a hybrid approach for LucidLink volumes:
-- **Initial Scan**: Standard CSV/Parquet import captures complete file inventory
-- **Ongoing Updates**: Monitor `.lucid_audit` folder for `.active` files to update `last_accessed` timestamps
-- **Impact**: This affects staging tables, update workflows, and planner re-evaluation logic
+## Decisions Made
 
-## Scope & Retention
-- Should the core database retain only stubbed file records, or do we still need a short-term cache of full scan metadata for rule evaluation and reporting?
-ANSWER: We will need an initial full scan of all the entire file system to get abase line of all the files and there timestamps. So no need all files and a record of files that have been stubbed
-- If non-stubbed file data is dropped, how do we support future rule changes that need historical context (e.g., rerunning policies, producing space-savings estimates)?
-ANSWER: we will not be dropping them we need them for reference
-- **NEW**: For LucidLink volumes, should we distinguish between files scanned via initial CSV import vs. files only updated via audit logs?
-OPEN: Do we need a flag/column indicating update source (full_scan, audit_log, incremental_scan)?
-- What retention period is required for stubbed file records and their lifecycle states (planned, stubbed, rehydrated, deleted)?
-ANSWER: The retension period for with regauds to automatiaclly removeing files is not an option however:
-planned = will be either a default setting of 1 year or older or a custom setting from the client
-stubed = remain for ever unless one of the other rules overide it
-rehydrated = Rules to be determined  but will be set in the clients global settings
-deleted = Rules to be determined but will be set in the clients global settings
-- Do we need to snapshot stub states over time for analytics/audit, or can we rely on the latest state plus an audit log?
-ANSWER: no
+### LucidLink Integration
+- **Hybrid Approach**: Initial CSV/Parquet scan + ongoing `.lucid_audit` monitoring for `last_accessed` updates
+- **No Incremental Scans**: New files added via audit logs only
+- **Update Source Tracking**: Add `last_accessed_source` ENUM ('initial_scan', 'lucidlink_audit')
 
-## Staging & Ingest Flow
-- Once the CSV/Parquet batch lands in staging, which columns must persist into the core schema versus being used only for transient calculations?
-ANSER: 
-- Can staging tables be truncated immediately after tiering decisions are made, or do we require delayed cleanup for troubleshooting?
-- How should we handle partial ingest failures when only stubbed records are stored—do we retry at the file level or reprocess the entire batch?
-- **NEW**: Do we need a separate staging table for LucidLink audit updates (`staging_lucid_audit`) or can we reuse existing staging infrastructure?
-RECOMMENDATION: Separate table due to different schema (only file_path + timestamp vs. full metadata)
-- **NEW**: What is the retention period for `staging_lucid_audit` records? Can they be truncated immediately after processing?
-RECOMMENDATION: Truncate after successful processing + audit log entry; retain 24 hours for troubleshooting
-- **NEW**: How do we handle LucidLink audit events for files not in our inventory (deleted files, new files not yet scanned)?
-OPEN: Should we queue these for investigation or ignore them?
+### Data Retention
+- **All Files Retained**: Both stubbed and non-stubbed files remain in database for reference
+- **Deleted Files**: Keep for 7 years for external audit purposes
+- **Stub States**: No historical snapshots needed; rely on current state + audit log
+- **Lifecycle Retention**:
+  - `planned`: 1 year default (client configurable)
+  - `stubbed`: Permanent until rules change
+  - `rehydrated`: Per client global settings
+  - `deleted`: Per client global settings
 
-## Stub Registry Model
-- What minimal attributes define a stubbed object (e.g., source path, tiered URI, hash, size, timestamps, job reference, agent/host)?
-- Do we need to track multiple stub incarnations for the same file path (e.g., when a file is rehydrated then re-tiered)?
-- How do we represent relationships between stubs and tiering jobs or planner runs?
-- Are there tenant-specific metadata fields (custom tags, business units) that must live with the stub record?
-- **NEW**: Should the file inventory table include an `update_source` column to track whether last_accessed came from full scan or LucidLink audit?
-RECOMMENDATION: Add `last_accessed_source` ENUM ('initial_scan', 'lucidlink_audit', 'incremental_scan', 'manual')
-- **NEW**: Do we need `updated_utc` timestamp on file records to track when last_accessed was last modified?
-RECOMMENDATION: Yes, add `updated_utc` column for audit trail and debugging
+### Stub Registry
+- **Single Record Per File**: No tracking of multiple incarnations; status flag only
+- **No Custom Metadata**: No tenant-specific tags or business unit fields needed
+- **Add Updated Timestamp**: Include `updated_utc` for audit trail
 
-## Rehydration & Recovery
-- What data is required to orchestrate rehydration without a full file inventory (e.g., original NTFS ACLs, ownership, compression/encryption parameters)?
-- Should rehydration attempts update the same stub record, create child records, or log events elsewhere?
-- How do we ensure orphan detection if only stub data is stored—do we inventory Tier-2 storage separately and compare against stub registry?
-- **NEW**: When LucidLink audit logs indicate file access, should we automatically trigger rehydration for stubbed files?
-OPEN: Define policy—immediate rehydration vs. alert-only vs. configurable per customer
-- **NEW**: How do we track "warming" events—files that were stubbed but recently accessed per audit logs?
-RECOMMENDATION: Add `tier_object.last_accessed_utc` and `tier_object.access_count` for trending analysis
+### Rehydration
+- **Driver Managed**: NTFS ACLs, ownership, compression handled by EaseFilter driver
+- **Same Record Update**: Rehydration updates existing record (remove stub status)
+- **Orphan Detection**: Track stub + Tier-2 location; verify both exist
 
-## Multi-Tenancy & Security
-- Will we continue with shared tables plus row-level security, or is a schema-per-tenant layout preferable for the reduced data set?
-- Which columns need encryption at rest via Vault (e.g., tiered_location, credentials, hashes)?
-- How are tenant-scoped API tokens mapped to database roles and RLS policies during ingest and planner execution?
+### Security & Tenancy
+- **Shared Schema**: Common schema for all tenants with row-level security
+- **Encrypt All Sensitive Columns**: tiered_location, credentials, hashes via Vault
 
-## Audit & Observability
-- What events must be captured in the audit log to evidence stub lifecycle changes (creation, rehydration, deletion, failure)?
-- Do we need derived tables or materialized views for dashboards, or can analytics read directly from the stub registry and audit log?
-- Which metrics should be exposed for monitoring stub throughput, failures, and storage consumption?
+### Audit & Monitoring
+- **Log All Events**: All stub lifecycle changes (creation, rehydration, deletion, failure)
+- **Key Metric**: Space saved on LucidLink storage
 
-## Integration with Planner & Actor
-- How will the planner evaluate tiering rules if the core store lacks non-stubbed file metadata? Do we compute rule matches entirely in-memory from staging?
-- What identifiers do planner and actor services use to correlate jobs with stub records when only stubbed data is persisted?
-- Do we need to persist planner scoring/estimates (space saved, duration) alongside the stub record for reporting?
-- **NEW**: Should the planner be triggered after every LucidLink audit batch update, or only when updates affect planned/stubbed files?
-RECOMMENDATION: Selective re-evaluation—only check files in 'PLANNED' or 'STUBBED' state
-- **NEW**: How do we handle race conditions where audit logs update last_accessed while tiering is in progress?
-OPEN: Need locking strategy or state machine to prevent conflicts
-- **NEW**: What is the acceptable lag between audit log event and planner re-evaluation?
+---
+
+## Open Questions: Staging & Ingest Flow
+
+### CSV/Parquet Staging
+- Which columns from staging must persist into core schema vs. transient calculations?
+  - **ACTION**: Define column mapping (staging → core schema)
+
+- Staging table cleanup strategy?
+  - **DECISION**: Retain staging data for troubleshooting; define retention period (24-48 hours?)
+
+### LucidLink Audit Staging
+- Separate `staging_lucid_audit` table confirmed
+- Staging cleanup: We read audit files only (no modifications)
+  - **ACTION**: Define read cursor tracking mechanism
+  - **ACTION**: Clarify if we copy audit data to our staging table or parse directly
+
+### Error Handling
+- Partial ingest failures: Log error, skip file, continue batch
+- **OPEN**: Retry logic for transient failures (network, locks)?
+- **OPEN**: Alert thresholds for batch failure rates?
+
+## Open Questions: Stub Registry Schema
+
+### Required Attributes
+- Minimal stub definition: source path, tiered URI, hash, size, timestamps, job reference, agent/host
+  - **ACTION**: Finalize complete column list for `tier_object` table
+
+### Schema Additions
+- Add `last_accessed_source` ENUM ('initial_scan', 'lucidlink_audit')
+- Add `updated_utc` timestamp
+- **OPEN**: Do we need `tier_object.last_accessed_utc` separate from file inventory?
+- **OPEN**: Track `access_count` for warming trend analysis?
+
+## Open Questions: Rehydration & Recovery
+
+### Rehydration Triggers
+- **CRITICAL**: When audit logs show stubbed file access, what action?
+  - Option 1: Automatic immediate rehydration
+  - Option 2: Alert only (manual intervention)
+  - Option 3: Configurable per customer
+  - **ACTION**: Define policy and implement configuration
+
+### Pattern Recognition
+- Audit log pattern to identify rehydrated files?
+  - **ACTION**: Document LucidLink audit log patterns for rehydration events
+
+### Warming Events
+- Track recently accessed stubbed files for trend analysis
+  - **ACTION**: Confirm schema additions: `last_accessed_utc`, `access_count` on `tier_object`
+
+## Open Questions: Multi-Tenancy & Security
+
+### API Token to RLS Mapping
+- How are tenant-scoped API tokens mapped to database roles and RLS policies?
+  - **ACTION**: Define authentication flow and session management
+  - **ACTION**: Document connection pooler configuration with `SET app.tenant_id`
+
+## Open Questions: Analytics & Dashboards
+
+### Data Access Pattern
+- Direct queries vs. materialized views for dashboards?
+  - **ACTION**: Performance test both approaches
+  - **RECOMMENDATION**: Start with direct queries; add materialized views only if needed
+
+### Additional Metrics
+- Beyond "space saved on LucidLink storage", which metrics are critical?
+  - **ACTION**: Define complete metrics list for monitoring dashboards
+
+## Open Questions: Planner & Actor Integration
+
+### Rule Evaluation
+- Planner rule evaluation with full file inventory available
+  - **ACTION**: Confirm planner reads from core `file` table (not staging)
+
+### Job Correlation
+- Identifiers for correlating planner jobs with stub records
+  - **ACTION**: Define job schema and foreign key relationships
+
+### Planner Scoring
+- Persist estimates (space saved, duration) with stub records?
+  - **ACTION**: Decide if estimates stored or calculated on-demand
+
+### LucidLink Audit Triggers
+- **DECISION**: Selective re-evaluation (only 'PLANNED' or 'STUBBED' files)
+- **OPEN**: Race condition handling - need locking strategy or state machine
+- **DECISION**: Target lag < 15 minutes for stubbed files; batch for planned files
+  - **ACTION**: Implement state machine or advisory locks to prevent conflicts
 RECOMMENDATION: Near real-time (< 15 minutes) for stubbed files; batch processing for planned files
 
-## Migration & Tooling
-- What is the bootstrap process for creating tenants, hosts, and stub records in development environments?
-- Which migrations, seed data, or fixtures are required so engineers can run end-to-end flows locally?
-- Do we need rollback strategies for schema changes given the reduced dataset, and how will we validate them in CI?
+## Open Questions: Migration & Tooling
 
-## LucidLink Audit Log Specific Questions
+### Development Environment
+- Bootstrap process for creating tenants, hosts, and stub records
+  - **ACTION**: Create seed data scripts
 
-### Parsing & Format
-- What is the exact format of `.active` files in `.lucid_audit` folders?
-OPEN: Need LucidLink documentation or reverse engineering
-- Do audit files contain event IDs for idempotency, or must we generate our own?
-OPEN: Test with real LucidLink volume
-- What access types are logged (read, write, modify, delete, metadata)? Do we care about all or just "read" for last_accessed?
-RECOMMENDATION: Focus on read/open events for last_accessed updates
+### Database Migrations
+- Migration strategy and rollback procedures
+  - **ACTION**: Choose migration tool (Flyway, Liquibase, native Postgres)
+  - **ACTION**: Define CI validation process
 
-### Performance & Scalability
-- How many audit events are generated per day for a typical LucidLink volume?
-OPEN: Need baseline metrics to size staging tables and workers
-- What is the size of `.active` files? Can they fit in memory for parsing?
-OPEN: May need streaming parser for large audit files
-- Should we process audit files sequentially or in parallel?
-RECOMMENDATION: Parallel processing with worker pool; track progress per file
+### Fixtures for Testing
+- Sample data for local end-to-end testing
+  - **ACTION**: Create fixture data representing typical customer scenarios
 
-### State Management
-- How do we track "last processed position" in each audit file to support incremental processing?
-RECOMMENDATION: Add `lucid_audit_cursor` table with (tenant_id, volume_id, audit_file, last_position, last_event_id, last_processed_utc)
-- What happens when audit files are rotated/archived by LucidLink?
-OPEN: Need to handle file renames, deletions, and potential gaps
+## Critical: LucidLink Audit Log Investigation Required
 
-### Data Quality
-- How do we validate that audit log timestamps are trustworthy and not clock-skewed?
-RECOMMENDATION: Compare against last known timestamp; reject if > 7 days in future or too far in past
-- What if audit logs reference files with paths that don't match our inventory?
-RECOMMENDATION: Log warnings; optionally queue for next full scan
+### Parsing & Format (BLOCKING)
+- **Exact format of `.active` files** - Need LucidLink documentation or reverse engineering
+  - **ACTION**: Contact LucidLink support or test with production volume
+  - **ACTION**: Document file format, field definitions, encoding
 
-## Open Assumptions to Validate
-- Rule evaluation can operate without the full file inventory once stub creation is complete.
-- All reporting requirements can be satisfied using stub records plus audits.
-- Agents can supply any additional metadata needed for rehydration on demand rather than relying on stored file attributes.
-- **NEW**: LucidLink audit logs provide sufficient accuracy for last_accessed updates (no missed events, no corruption)
-- **NEW**: Polling `.lucid_audit` every 5 minutes does not impact LucidLink performance or stability
-- **NEW**: Audit log format is stable across LucidLink versions (forward/backward compatibility)
+- **Event IDs for idempotency** - Test with real LucidLink volume
+  - **ACTION**: Determine if native event IDs exist or must be generated
+  - **ACTION**: Design idempotency strategy
+
+- **Access types logged** - Which events update last_accessed?
+  - **RECOMMENDATION**: Focus on read/open events
+  - **ACTION**: Confirm complete list of logged event types
+
+### Performance & Scalability (BLOCKING)
+- **Event volume** - How many events/day for typical LucidLink volume?
+  - **ACTION**: Gather baseline metrics to size infrastructure
+
+- **File size** - Can `.active` files fit in memory?
+  - **ACTION**: Test with production volumes
+  - **DECISION**: Implement streaming parser if files > 100MB
+
+- **Processing strategy**
+  - **RECOMMENDATION**: Parallel processing with worker pool
+  - **ACTION**: Design worker pool architecture and progress tracking
+
+### State Management (HIGH PRIORITY)
+- **Cursor tracking** - How to track last processed position?
+  - **RECOMMENDATION**: Add `lucid_audit_cursor` table
+  - Schema: (tenant_id, volume_id, audit_file, last_position, last_event_id, last_processed_utc)
+  - **ACTION**: Implement cursor persistence and recovery
+
+- **File rotation handling** - What happens when LucidLink rotates/archives logs?
+  - **ACTION**: Test rotation behavior and design gap detection
+
+### Data Quality (HIGH PRIORITY)
+- **Timestamp validation** - Prevent clock skew issues
+  - **RECOMMENDATION**: Reject timestamps > 7 days future or far past
+  - **ACTION**: Implement validation logic
+
+- **Unknown file paths** - Audit logs reference files not in inventory
+  - **DECISION**: New files added via audit logs; deleted files retained 7 years
+  - **ACTION**: Implement new file insertion workflow
+
+---
+
+## Assumptions Requiring Validation
+
+### LucidLink Specific
+1. **Audit log accuracy** - No missed events, no corruption
+   - **VALIDATION**: Test under load and verify against known file access patterns
+
+2. **Polling impact** - 5-minute polling doesn't degrade LucidLink performance
+   - **VALIDATION**: Monitor LucidLink metrics during pilot
+
+3. **Format stability** - Audit log format stable across LucidLink versions
+   - **VALIDATION**: Request forward compatibility guarantee from LucidLink
+
+### General
+1. **Full inventory available** - Rule evaluation works with complete file inventory
+   - **VALIDATION**: Confirmed by design decisions
+
+2. **Reporting from core tables** - No need for complex aggregations
+   - **VALIDATION**: Review reporting requirements; performance test queries
+
+3. **Driver provides rehydration metadata** - No need to store NTFS details
+   - **VALIDATION**: Confirm with EaseFilter documentation
 
