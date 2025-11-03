@@ -2,12 +2,14 @@
 
 ## Problem Statement
 
-The data model open questions document identifies several gaps between the proposed schema (in `prostgresql_Proposal.md`) and the requirements that have been finalized through recent decisions. Specifically:
+**STATUS: ✅ ALL ISSUES RESOLVED**
 
-1. **Inconsistent Table Names**: Flow diagram references `file_inventory` table, but PostgreSQL proposal uses normalized `file` table
-2. **Missing Columns**: Decisions require `last_accessed_source` and `updated_utc` columns not present in current schema
-3. **LucidLink-Specific Tracking**: Need cursor/state management tables for audit log processing
-4. **Unclear Relationship**: The `file` table in proposal is scan-based (immutable snapshots), but LucidLink audit updates require mutable records
+The data model open questions document identified several gaps between the proposed schema (in `prostgresql_Proposal.md`) and the requirements that have been finalized through recent decisions. These have all been addressed:
+
+1. ✅ **Inconsistent Table Names**: RESOLVED - All documentation now consistently uses `file_current` table
+2. ✅ **Missing Columns**: RESOLVED - Added `last_accessed_source`, `updated_utc`, and `atime_updated_utc` columns
+3. ✅ **LucidLink-Specific Tracking**: RESOLVED - Added `lucid_audit_cursor` table for position tracking
+4. ✅ **Unclear Relationship**: RESOLVED - Implemented hybrid approach with `file_current` for mutable state
 
 ## Current State Analysis
 
@@ -75,12 +77,15 @@ CREATE TABLE file (
 CREATE INDEX idx_file_tenant_scan ON file (tenant_id, scan_id);
 CREATE INDEX idx_file_atime ON file (tenant_id, atime_unix);
 ```
-**Issues**: 
-- ❌ No `updated_utc` column for tracking when `atime_unix` was last modified
-- ❌ No `last_accessed_source` to track update origin
-- ❌ Scan-based design makes LucidLink audit updates problematic (creates duplicate records per scan)
-- ❌ Missing `file_hash` column mentioned in flow diagram
-- ❌ Missing `file_extension` column mentioned in flow diagram
+**Status**: ✅ Complete - Kept as-is for immutable scan history
+
+**Previous Issues - ALL RESOLVED**:
+- ✅ No `updated_utc` needed - this table remains immutable
+- ✅ No `last_accessed_source` needed - tracking moved to `file_current`
+- ✅ Scan-based design issue resolved - added `file_current` for LucidLink updates
+- ✅ `file_hash` and `file_extension` added to `file_current` table
+
+**Note**: The `file` table intentionally does NOT have these columns because it stores immutable snapshots. The new `file_current` table handles all mutable state and tracking.
 
 #### 5. `tier_object` table (operational state)
 ```sql
@@ -95,14 +100,23 @@ CREATE TABLE tier_object (
   planned_utc timestamptz NOT NULL DEFAULT now(),
   acted_utc timestamptz,
   last_seen_utc timestamptz,
+  
+  -- NEW: Warming event tracking
+  last_accessed_utc timestamptz,
+  access_count integer NOT NULL DEFAULT 0,
+  file_current_id bigint REFERENCES file_current(file_current_id),
+  
   UNIQUE (tenant_id, full_path)
 );
 CREATE INDEX idx_tier_object_tenant_state ON tier_object (tenant_id, state);
+CREATE INDEX idx_tier_object_file_current ON tier_object (file_current_id);
 ```
-**Issues**:
-- ❌ Missing `last_accessed_utc` for warming event tracking
-- ❌ Missing `access_count` for trend analysis
-- ❌ No relationship to `file` table (no foreign key)
+**Status**: ✅ Complete - All enhancements added
+
+**Previous Issues - ALL RESOLVED**:
+- ✅ Added `last_accessed_utc` for warming event tracking
+- ✅ Added `access_count` for trend analysis
+- ✅ Added `file_current_id` foreign key relationship
 
 #### 6. Staging tables
 ```sql
@@ -145,56 +159,79 @@ CREATE TABLE lucid_audit_processed (
   PRIMARY KEY (tenant_id, volume_id, audit_event_id)
 );
 ```
-**Status**: ✅ Complete for staging, but missing cursor tracking
+**Status**: ✅ Complete - cursor tracking added (see `lucid_audit_cursor` below)
 
-### Update Logic (from prostgresql_Proposal.md lines 384-404)
-
+#### 7. `lucid_audit_cursor` table (NEW - cursor tracking)
 ```sql
--- Current approach: Update file table directly
-UPDATE file f
+CREATE TABLE lucid_audit_cursor (
+  cursor_id bigserial PRIMARY KEY,
+  tenant_id uuid NOT NULL REFERENCES tenant(tenant_id),
+  volume_id text NOT NULL,
+  audit_file_path text NOT NULL,
+  last_position bigint NOT NULL DEFAULT 0,
+  last_event_id text,
+  last_processed_utc timestamptz NOT NULL DEFAULT now(),
+  UNIQUE (tenant_id, volume_id, audit_file_path)
+);
+CREATE INDEX idx_lucid_audit_cursor_tenant_vol ON lucid_audit_cursor (tenant_id, volume_id);
+```
+**Status**: ✅ Complete - Added for LucidLink audit position tracking
+
+### Update Logic - RESOLVED ✅
+
+**Old Approach (had issues)**:
+```sql
+-- Previous approach: Update file table directly
+UPDATE file f  -- ❌ Would update ALL scans containing that file
 SET atime_unix = s.new_last_accessed,
-    updated_utc = now()  -- Column doesn't exist!
+    updated_utc = now()  -- ❌ Column didn't exist!
+...
+```
+
+**NEW Approach (implemented)**:
+```sql
+-- Update file_current (mutable operational state)
+UPDATE file_current fc
+SET atime_unix = s.new_last_accessed,
+    last_accessed_source = 'lucidlink_audit',
+    atime_updated_utc = now(),
+    updated_utc = now()
 FROM staging_lucid_audit s
-JOIN dir d ON d.tenant_id = s.tenant_id 
-          AND d.dir_path = substring(s.file_path from 1 for position('\\' in reverse(s.file_path)))
-WHERE f.tenant_id = s.tenant_id
-AND f.dir_id = d.dir_id
-AND f.name = substring(s.file_path from position('\\' in reverse(s.file_path)) + 1)
-AND s.new_last_accessed > f.atime_unix;
+WHERE fc.tenant_id = s.tenant_id
+  AND fc.full_path = s.file_path
+  AND s.new_last_accessed > fc.atime_unix;
+
+-- Update warming events for stubbed files
+UPDATE tier_object t
+SET last_accessed_utc = to_timestamp(s.new_last_accessed),
+    access_count = t.access_count + 1
+FROM staging_lucid_audit s
+WHERE t.tenant_id = s.tenant_id
+  AND t.full_path = s.file_path
+  AND t.state IN ('PLANNED', 'STUBBED');
 ```
 
-**Critical Issue**: This UPDATE statement references `updated_utc` column that doesn't exist in the schema. Also, it would update ALL scans containing that file, not just the latest.
+**Status**: ✅ Resolved - Now updates `file_current` (single record per file) with proper tracking columns
 
-### Documentation Conflicts
+### Documentation Conflicts - RESOLVED ✅
 
-**flow_Diagram.md (lines 145-161)** references `file_inventory` table:
-```
-- Table: `public.file_inventory`
-- Columns:
-  - `id` (UUID, primary key)
-  - `customer_id` (UUID, foreign key)
-  - `host_id` (UUID, foreign key)
-  - `file_path` (TEXT, indexed)
-  - `file_size` (BIGINT)
-  - `last_modified` (TIMESTAMP)
-  - `last_accessed` (TIMESTAMP)
-  - `file_extension` (VARCHAR(10))
-  - `file_hash` (VARCHAR(64))
-  - `is_stubbed` (BOOLEAN)
-  - `stub_created_at` (TIMESTAMP)
-  - `tiered_location` (TEXT)
-  - `last_scan_time` (TIMESTAMP)
-  - `created_at` (TIMESTAMP)
-  - `updated_at` (TIMESTAMP)
-```
+**Previous Issue**: flow_Diagram.md referenced `file_inventory` table that didn't match PostgreSQL proposal's `file` table design.
 
-This is a **different design** from the normalized `scan` + `dir` + `file` approach in PostgreSQL proposal.
+**Resolution**: All documentation now consistently uses the hybrid approach:
+- `file` table for immutable scan snapshots
+- `file_current` table for mutable operational state (maps to what was called `file_inventory`)
+- All references updated across:
+  - ✅ `prostgresql_Proposal.md`
+  - ✅ `flow_Diagram.md`
+  - ✅ `data_model_open_questions.md`
+  - ✅ `SCHEMA_IMPLEMENTATION_PLAN.md`
+  - ✅ New: `schema/core_schema.sql`
 
 ---
 
-## Design Decision Required
+## Design Decision - RESOLVED ✅
 
-**CRITICAL CHOICE**: We must choose between two architectural approaches:
+**DECISION MADE**: Hybrid Approach (Option C) implemented
 
 ### Option A: Scan-Based Immutable Snapshots (Current Proposal)
 - Each scan creates new `file` records
@@ -210,14 +247,16 @@ This is a **different design** from the normalized `scan` + `dir` + `file` appro
 - Less storage overhead
 - Need separate history tracking for compliance
 
-**RECOMMENDATION**: **Hybrid Approach**
+**✅ IMPLEMENTED: Hybrid Approach**
 
-1. Keep normalized `scan` + `dir` + `file` for **immutable scan history**
-2. Add new `file_current` table for **mutable current state** that gets updated by:
+1. ✅ Keep normalized `scan` + `dir` + `file` for **immutable scan history**
+2. ✅ Added new `file_current` table for **mutable current state** that gets updated by:
    - Initial scans (upsert)
    - LucidLink audit logs (update `atime_unix` only)
-3. Use `file_current` for planner rule evaluation
-4. Keep `file` snapshots for historical analysis and compliance
+3. ✅ `file_current` used for planner rule evaluation
+4. ✅ `file` snapshots kept for historical analysis and compliance
+
+**Implementation Status**: Complete - See `schema/core_schema.sql` for full DDL
 
 ---
 
@@ -353,12 +392,13 @@ ALTER TABLE staging_file
 
 ## Implementation Tasks
 
-### Phase 1: Schema Migration (DDL)
-- [ ] Create `file_current` table with all columns and indexes
-- [ ] Create `lucid_audit_cursor` table
-- [ ] Alter `tier_object` to add tracking columns
-- [ ] Alter `staging_file` to add hash and extension
-- [ ] Add RLS policies for new tables
+### Phase 1: Schema Migration (DDL) - ✅ COMPLETE
+- [x] Create `file_current` table with all columns and indexes
+- [x] Create `lucid_audit_cursor` table
+- [x] Alter `tier_object` to add tracking columns
+- [x] Alter `staging_file` to add hash and extension
+- [x] Add RLS policies for new tables
+- [x] Complete DDL available in `schema/core_schema.sql`
 
 ### Phase 2: Ingest Worker Updates
 - [ ] Modify initial scan ingest to populate both `file` AND `file_current`
@@ -410,23 +450,31 @@ ALTER TABLE staging_file
 
 ---
 
-## Files Requiring Updates
+## Files Requiring Updates - ✅ ALL COMPLETE
 
-1. **prostgresql_Proposal.md**
-   - Add `file_current` table definition
-   - Add `lucid_audit_cursor` table definition
-   - Update section 6.4 LucidLink audit processing with correct column names
-   - Document hybrid approach (immutable snapshots + mutable current state)
+1. ✅ **prostgresql_Proposal.md**
+   - [x] Added `file_current` table definition with all columns
+   - [x] Added `lucid_audit_cursor` table definition
+   - [x] Updated section 6.4 LucidLink audit processing with correct column names
+   - [x] Documented hybrid approach explanation at beginning of schema section
+   - [x] Updated all SQL examples to use `file_current`
 
-2. **flow_Diagram.md**
-   - Update "Core Inventory Schema" section to reflect actual table names
-   - Remove references to `file_inventory` or clarify it refers to `file_current`
-   - Update database update logic SQL example
+2. ✅ **flow_Diagram.md**
+   - [x] Updated "Core Inventory Schema" section with hybrid approach explanation
+   - [x] Changed all references from `file_inventory` to `file_current`
+   - [x] Updated database update logic SQL with warming event tracking
+   - [x] Added comprehensive documentation of dual-table architecture
 
-3. **data_model_open_questions.md**
-   - Mark schema questions as resolved
-   - Add note about hybrid approach decision
-   - Move to validation phase for testing questions
+3. ✅ **data_model_open_questions.md**
+   - [x] Added "Resolved: Core Schema Implementation" section
+   - [x] Documented hybrid approach decision
+   - [x] Listed all schema additions with checkmarks
+   - [x] Included complete `file_current` schema for reference
+
+4. ✅ **NEW: schema/core_schema.sql**
+   - [x] Complete standalone DDL file created
+   - [x] Ready for deployment to PostgreSQL
+   - [x] Includes all tables, indexes, RLS policies, and comments
 
 ---
 
