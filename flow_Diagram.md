@@ -88,7 +88,7 @@ flowchart TD
     BulkLoad --> Normalize[Ingest: Normalize Data<br/>- Parse timestamps<br/>- Calculate sizes<br/>- Extract extensions<br/>- Generate hashes]
     
     Normalize --> Dedupe[Ingest: Deduplicate &<br/>Merge with Existing Inventory]
-    Dedupe --> Upsert[Ingest: UPSERT to<br/>Core file_inventory table]
+    Dedupe --> Upsert[Ingest: UPSERT to<br/>Core file_current table]
     
     Upsert --> UpdateMeta[Update Host Metadata<br/>- Last scan time<br/>- File count<br/>- Total size]
     UpdateMeta --> TriggerPlanner[Trigger Planner Service]
@@ -142,23 +142,42 @@ file_path,file_size,last_modified,last_accessed,file_extension,permissions,owner
 - Retention: 7 days
 
 #### 3. **Core Inventory Schema** (Postgres)
-- Table: `public.file_inventory`
+
+**Hybrid Approach**: The system maintains both immutable scan snapshots and a mutable current state:
+
+**A. Immutable Scan History** (`file` table)
+- One record per file per scan (historical point-in-time snapshots)
+- Used for compliance, audit trail, and historical analysis
+- Columns: `file_id`, `tenant_id`, `scan_id`, `dir_id`, `name`, `size_bytes`, `atime_unix`, `mtime_unix`, `ctime_unix`, `frn`
+
+**B. Current Operational State** (`file_current` table - used by planner)
+- One record per unique file (mutable, updated by scans and LucidLink audit)
+- Used for rule evaluation and tiering decisions
 - Columns:
-  - `id` (UUID, primary key)
-  - `customer_id` (UUID, foreign key)
-  - `host_id` (UUID, foreign key)
-  - `file_path` (TEXT, indexed)
-  - `file_size` (BIGINT)
-  - `last_modified` (TIMESTAMP)
-  - `last_accessed` (TIMESTAMP)
-  - `file_extension` (VARCHAR(10))
-  - `file_hash` (VARCHAR(64))
-  - `is_stubbed` (BOOLEAN)
-  - `stub_created_at` (TIMESTAMP)
-  - `tiered_location` (TEXT)
-  - `last_scan_time` (TIMESTAMP)
-  - `created_at` (TIMESTAMP)
-  - `updated_at` (TIMESTAMP)
+  - `file_current_id` (bigserial, primary key)
+  - `tenant_id` (UUID, foreign key)
+  - `share_name` (TEXT)
+  - `dir_id` (bigint, foreign key to `dir`)
+  - `name` (TEXT)
+  - `full_path` (TEXT, indexed) - denormalized for quick lookup
+  - `size_bytes` (BIGINT)
+  - `atime_unix` (INTEGER) - last accessed time
+  - `mtime_unix` (INTEGER) - last modified time
+  - `ctime_unix` (INTEGER) - creation time
+  - `file_hash` (TEXT)
+  - `file_extension` (TEXT)
+  - `last_accessed_source` (TEXT) - enum: 'initial_scan' or 'lucidlink_audit'
+  - `atime_updated_utc` (TIMESTAMPTZ) - when last_accessed was updated
+  - `first_seen_scan_id` (bigint, foreign key)
+  - `last_seen_scan_id` (bigint, foreign key)
+  - `last_scan_utc` (TIMESTAMPTZ)
+  - `created_utc` (TIMESTAMPTZ)
+  - `updated_utc` (TIMESTAMPTZ)
+
+**C. Tiering State** (`tier_object` table)
+- Operational state machine for stubbing/rehydration
+- Now includes warming event tracking
+- Columns include: `state`, `planned_utc`, `acted_utc`, `last_accessed_utc`, `access_count`, `file_current_id`
 
 #### 4. **Rule Evaluation Logic**
 For each file, the Planner evaluates in priority order:
@@ -247,8 +266,8 @@ flowchart TD
     StageUpdate --> QueueUpdate[API: Queue Update Job<br/>to Message Queue]
     QueueUpdate --> UpdateWorker[Update Worker: Pick Job]
     
-    UpdateWorker --> LookupFiles[Worker: Lookup Files<br/>in file_inventory table]
-    LookupFiles --> UpdateTimestamps[Worker: UPDATE<br/>last_accessed timestamps]
+    UpdateWorker --> LookupFiles[Worker: Lookup Files<br/>in file_current table]
+    LookupFiles --> UpdateTimestamps[Worker: UPDATE<br/>atime_unix in file_current]
     
     UpdateTimestamps --> AuditLogEntry[Write Audit Log Entry<br/>Timestamp update source: LucidLink]
     AuditLogEntry --> NotifyMetrics[Update Metrics<br/>Files processed, update latency]
@@ -298,17 +317,29 @@ flowchart TD
 
 #### 4. **Database Update Logic**
 ```sql
--- Update last_accessed for matched files
-UPDATE file_inventory fi
+-- Update last_accessed for matched files in file_current
+UPDATE file_current fc
 SET 
-  last_accessed = u.new_last_accessed,
-  updated_at = now(),
-  update_source = 'lucidlink_audit'
-FROM audit_updates_staging u
+  atime_unix = s.new_last_accessed,
+  last_accessed_source = 'lucidlink_audit',
+  atime_updated_utc = now(),
+  updated_utc = now()
+FROM staging_lucid_audit s
 WHERE 
-  fi.customer_id = u.customer_id
-  AND fi.file_path = u.file_path
-  AND u.new_last_accessed > fi.last_accessed; -- Only update if newer
+  fc.tenant_id = s.tenant_id
+  AND fc.full_path = s.file_path
+  AND s.new_last_accessed > fc.atime_unix; -- Only update if newer
+
+-- Update warming events for stubbed files
+UPDATE tier_object t
+SET 
+  last_accessed_utc = to_timestamp(s.new_last_accessed),
+  access_count = t.access_count + 1
+FROM staging_lucid_audit s
+WHERE 
+  t.tenant_id = s.tenant_id
+  AND t.full_path = s.file_path
+  AND t.state IN ('PLANNED', 'STUBBED');
 ```
 
 #### 5. **Re-evaluation Triggers**

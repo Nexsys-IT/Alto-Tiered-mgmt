@@ -61,17 +61,54 @@ Open questions to resolve before locking the PostgreSQL schema and provisioning 
 - **OPEN**: Retry logic for transient failures (network, locks)?
 - **OPEN**: Alert thresholds for batch failure rates?
 
+## Resolved: Core Schema Implementation
+
+### Hybrid Approach Adopted
+**DECISION**: Implemented dual-table design:
+1. **`file` table**: Immutable scan snapshots (historical compliance/audit)
+2. **`file_current` table**: Mutable operational state (planner uses this)
+
+### Schema Additions Completed
+- ✅ `file_current` table with all required columns
+- ✅ `last_accessed_source` ENUM ('initial_scan', 'lucidlink_audit')
+- ✅ `updated_utc` and `atime_updated_utc` timestamps
+- ✅ `tier_object.last_accessed_utc` for warming event tracking
+- ✅ `tier_object.access_count` for trend analysis
+- ✅ `tier_object.file_current_id` foreign key relationship
+- ✅ `lucid_audit_cursor` table for position tracking
+- ✅ `staging_file` enhanced with `file_hash` and `file_extension`
+
+### Complete `file_current` Schema
+```sql
+CREATE TABLE file_current (
+  file_current_id bigserial PRIMARY KEY,
+  tenant_id uuid NOT NULL REFERENCES tenant(tenant_id),
+  share_name text NOT NULL,
+  dir_id bigint NOT NULL REFERENCES dir(dir_id),
+  name text NOT NULL,
+  full_path text NOT NULL,
+  size_bytes bigint NOT NULL,
+  atime_unix integer NOT NULL,
+  mtime_unix integer NOT NULL,
+  ctime_unix integer NOT NULL,
+  file_hash text,
+  file_extension text,
+  last_accessed_source text NOT NULL DEFAULT 'initial_scan',
+  atime_updated_utc timestamptz NOT NULL DEFAULT now(),
+  first_seen_scan_id bigint NOT NULL REFERENCES scan(scan_id),
+  last_seen_scan_id bigint NOT NULL REFERENCES scan(scan_id),
+  last_scan_utc timestamptz NOT NULL,
+  created_utc timestamptz NOT NULL DEFAULT now(),
+  updated_utc timestamptz NOT NULL DEFAULT now(),
+  UNIQUE (tenant_id, full_path)
+);
+```
+
 ## Open Questions: Stub Registry Schema
 
 ### Required Attributes
 - Minimal stub definition: source path, tiered URI, hash, size, timestamps, job reference, agent/host
-  - **ACTION**: Finalize complete column list for `tier_object` table
-
-### Schema Additions
-- Add `last_accessed_source` ENUM ('initial_scan', 'lucidlink_audit')
-- Add `updated_utc` timestamp
-- **OPEN**: Do we need `tier_object.last_accessed_utc` separate from file inventory?
-- **OPEN**: Track `access_count` for warming trend analysis?
+  - **STATUS**: Schema finalized in `prostgresql_Proposal.md`
 
 ## Open Questions: Rehydration & Recovery
 

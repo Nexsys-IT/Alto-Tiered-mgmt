@@ -37,6 +37,28 @@ Build a **central Postgres cluster** in your DC for concurrent ingest from many 
 
 **5) Database schema (normalized, RLS, partition-ready)**
 
+**Architecture: Hybrid Approach**
+
+The schema uses a **dual-table design** to balance historical accuracy with operational performance:
+
+1. **Immutable Scan History** (`file` table)
+   - One record per file per scan (point-in-time snapshots)
+   - Never updated after insertion
+   - Used for: compliance, audit trail, historical analysis, trending
+   - Retention: Based on scan retention policy
+
+2. **Mutable Current State** (`file_current` table)
+   - One record per unique file (operational current state)
+   - Updated by: initial scans (upsert) and LucidLink audit logs (timestamp updates)
+   - Used by: planner for rule evaluation, dashboard for current metrics
+   - Contains: `last_accessed_source` tracking and `atime_updated_utc` for audit
+
+**Why Hybrid?**
+- LucidLink audit logs update `last_accessed` frequently; updating scan snapshots would create duplicate records
+- Planner needs current file state, not historical snapshots
+- Compliance requires immutable audit trail of scans
+- Best of both worlds: historical accuracy + operational efficiency
+
 **5.1 Core tables (shared)**
 
 \-- Tenant registry (stores wrapped DEK; no plaintext)
@@ -131,6 +153,72 @@ CREATE INDEX idx_file_tenant_scan ON file (tenant_id, scan_id);
 
 CREATE INDEX idx_file_atime ON file (tenant_id, atime_unix);
 
+\-- Current file state (mutable, updated by scans and LucidLink audit)
+
+CREATE TABLE file_current (
+
+file_current_id bigserial PRIMARY KEY,
+
+tenant_id uuid NOT NULL REFERENCES tenant(tenant_id),
+
+share_name text NOT NULL,
+
+dir_id bigint NOT NULL REFERENCES dir(dir_id),
+
+name text NOT NULL,
+
+full_path text NOT NULL, -- denormalized for quick lookup
+
+size_bytes bigint NOT NULL,
+
+atime_unix integer NOT NULL,
+
+mtime_unix integer NOT NULL,
+
+ctime_unix integer NOT NULL,
+
+file_hash text,
+
+file_extension text,
+
+frn bigint, -- when NTFS local
+
+\-- LucidLink audit tracking
+
+last_accessed_source text NOT NULL DEFAULT 'initial_scan'
+
+CHECK (last_accessed_source IN ('initial_scan', 'lucidlink_audit')),
+
+atime_updated_utc timestamptz NOT NULL DEFAULT now(),
+
+\-- Scan tracking
+
+first_seen_scan_id bigint NOT NULL REFERENCES scan(scan_id),
+
+last_seen_scan_id bigint NOT NULL REFERENCES scan(scan_id),
+
+last_scan_utc timestamptz NOT NULL,
+
+\-- Audit timestamps
+
+created_utc timestamptz NOT NULL DEFAULT now(),
+
+updated_utc timestamptz NOT NULL DEFAULT now(),
+
+UNIQUE (tenant_id, full_path)
+
+);
+
+CREATE INDEX idx_file_current_tenant ON file_current (tenant_id);
+
+CREATE INDEX idx_file_current_dir ON file_current (dir_id);
+
+CREATE INDEX idx_file_current_atime ON file_current (tenant_id, atime_unix);
+
+CREATE INDEX idx_file_current_share ON file_current (tenant_id, share_name);
+
+CREATE INDEX idx_file_current_path ON file_current (tenant_id, full_path);
+
 \-- Operational tiering state machine
 
 CREATE TABLE tier_object (
@@ -155,11 +243,23 @@ acted_utc timestamptz,
 
 last_seen_utc timestamptz,
 
+\-- Warming event tracking (LucidLink audit)
+
+last_accessed_utc timestamptz,
+
+access_count integer NOT NULL DEFAULT 0,
+
+\-- Link to current file state
+
+file_current_id bigint REFERENCES file_current(file_current_id),
+
 UNIQUE (tenant_id, full_path)
 
 );
 
 CREATE INDEX idx_tier_object_tenant_state ON tier_object (tenant_id, state);
+
+CREATE INDEX idx_tier_object_file_current ON tier_object (file_current_id);
 
 \-- Tier-2 inventory captured by sanitizer
 
@@ -211,6 +311,8 @@ ALTER TABLE dir ENABLE ROW LEVEL SECURITY;
 
 ALTER TABLE file ENABLE ROW LEVEL SECURITY;
 
+ALTER TABLE file_current ENABLE ROW LEVEL SECURITY;
+
 ALTER TABLE tier_object ENABLE ROW LEVEL SECURITY;
 
 ALTER TABLE tier2_inventory ENABLE ROW LEVEL SECURITY;
@@ -230,6 +332,8 @@ CREATE POLICY p_scan ON scan USING (tenant_id = current_tenant());
 CREATE POLICY p_dir ON dir USING (tenant_id = current_tenant());
 
 CREATE POLICY p_file ON file USING (tenant_id = current_tenant());
+
+CREATE POLICY p_file_current ON file_current USING (tenant_id = current_tenant());
 
 CREATE POLICY p_tier_object ON tier_object USING (tenant_id = current_tenant());
 
@@ -284,7 +388,11 @@ atime_unix integer NOT NULL,
 
 mtime_unix integer NOT NULL,
 
-ctime_unix integer NOT NULL
+ctime_unix integer NOT NULL,
+
+file_hash text,
+
+file_extension text
 
 ) WITH (autovacuum_enabled = true);
 
@@ -338,6 +446,30 @@ primary key (tenant_id, volume_id, audit_event_id)
 
 );
 
+\-- Track processing position in LucidLink audit files
+
+CREATE TABLE lucid_audit_cursor (
+
+cursor_id bigserial PRIMARY KEY,
+
+tenant_id uuid NOT NULL REFERENCES tenant(tenant_id),
+
+volume_id text NOT NULL,
+
+audit_file_path text NOT NULL,
+
+last_position bigint NOT NULL DEFAULT 0,
+
+last_event_id text,
+
+last_processed_utc timestamptz NOT NULL DEFAULT now(),
+
+UNIQUE (tenant_id, volume_id, audit_file_path)
+
+);
+
+CREATE INDEX idx_lucid_audit_cursor_tenant_vol ON lucid_audit_cursor (tenant_id, volume_id);
+
 - If (tenant_id, scan_id, chunk_id) exists → **skip** (exactly-once semantics).
 
 **6.3 Normalize + upsert (ingest worker)**
@@ -368,6 +500,60 @@ JOIN dir d ON d.tenant_id = s.tenant_id AND d.dir_path = s.dir_path
 
 ON CONFLICT (scan_id, dir_id, name) DO NOTHING;
 
+- **Step 3: file_current upsert (mutable operational state)**
+
+INSERT INTO file_current (
+
+tenant_id, share_name, dir_id, name, full_path,
+
+size_bytes, atime_unix, mtime_unix, ctime_unix,
+
+file_hash, file_extension,
+
+last_accessed_source, atime_updated_utc,
+
+first_seen_scan_id, last_seen_scan_id, last_scan_utc
+
+)
+
+SELECT s.tenant_id, sc.share_name, d.dir_id, s.name,
+
+d.dir_path || '\\' || s.name AS full_path,
+
+s.size_bytes, s.atime_unix, s.mtime_unix, s.ctime_unix,
+
+s.file_hash, s.file_extension,
+
+'initial_scan', now(),
+
+sc.scan_id, sc.scan_id, sc.started_utc
+
+FROM staging_file s
+
+JOIN dir d ON d.tenant_id = s.tenant_id AND d.dir_path = s.dir_path
+
+JOIN scan sc ON sc.scan_id = s.scan_id
+
+ON CONFLICT (tenant_id, full_path) DO UPDATE
+
+SET size_bytes = EXCLUDED.size_bytes,
+
+atime_unix = EXCLUDED.atime_unix,
+
+mtime_unix = EXCLUDED.mtime_unix,
+
+ctime_unix = EXCLUDED.ctime_unix,
+
+file_hash = EXCLUDED.file_hash,
+
+file_extension = EXCLUDED.file_extension,
+
+last_seen_scan_id = EXCLUDED.last_seen_scan_id,
+
+last_scan_utc = EXCLUDED.last_scan_utc,
+
+updated_utc = now();
+
 - Mark chunk complete; optionally **truncate** that chunk from staging.
 - When all chunks complete, set scan.status='OK' and finished_utc=now().
 
@@ -381,27 +567,41 @@ WHERE tenant_id = ? AND volume_id = ? AND audit_event_id = ANY(?);
 
 - Skip already-processed events.
 
-- **Step 2: Update last_accessed timestamps**
+- **Step 2: Update last_accessed timestamps in file_current**
 
-UPDATE file f
+UPDATE file_current fc
 
 SET atime_unix = s.new_last_accessed,
 
-    updated_utc = now()
+last_accessed_source = 'lucidlink_audit',
+
+atime_updated_utc = now(),
+
+updated_utc = now()
 
 FROM staging_lucid_audit s
 
-JOIN dir d ON d.tenant_id = s.tenant_id 
+WHERE fc.tenant_id = s.tenant_id
 
-          AND d.dir_path = substring(s.file_path from 1 for position('\\' in reverse(s.file_path)))
+AND fc.full_path = s.file_path
 
-WHERE f.tenant_id = s.tenant_id
+AND s.new_last_accessed > fc.atime_unix; -- Only update if newer
 
-AND f.dir_id = d.dir_id
+- **Step 2b: Update warming events for stubbed files**
 
-AND f.name = substring(s.file_path from position('\\' in reverse(s.file_path)) + 1)
+UPDATE tier_object t
 
-AND s.new_last_accessed > f.atime_unix; -- Only update if newer
+SET last_accessed_utc = to_timestamp(s.new_last_accessed),
+
+access_count = t.access_count + 1
+
+FROM staging_lucid_audit s
+
+WHERE t.tenant_id = s.tenant_id
+
+AND t.full_path = s.file_path
+
+AND t.state IN ('PLANNED', 'STUBBED');
 
 - **Step 3: Log to audit trail**
 
@@ -425,9 +625,23 @@ WHERE audit_event_id IS NOT NULL
 
 ON CONFLICT DO NOTHING;
 
-- **Step 5: Trigger planner re-evaluation (optional)**
+- **Step 5: Update cursor position**
 
-If updated files were previously in 'PLANNED' or 'STUBBED' state, check if they should be excluded from tiering or rehydrated.
+INSERT INTO lucid_audit_cursor (tenant_id, volume_id, audit_file_path, last_position, last_event_id)
+
+VALUES (?, ?, ?, ?, ?)
+
+ON CONFLICT (tenant_id, volume_id, audit_file_path) DO UPDATE
+
+SET last_position = EXCLUDED.last_position,
+
+last_event_id = EXCLUDED.last_event_id,
+
+last_processed_utc = now();
+
+- **Step 6: Trigger planner re-evaluation (optional)**
+
+If updated files were previously in 'PLANNED' or 'STUBBED' state and access count exceeds threshold, trigger rehydration policy check.
 
 **Concurrency**
 
