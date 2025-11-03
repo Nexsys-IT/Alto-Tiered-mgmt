@@ -10,6 +10,7 @@ This solution enables policy-driven data lifecycle management with comprehensive
 
 - **Central Management Console** - Web-based interface for multi-customer tiering rule management
 - **EaseFilter Integration** - Pre-built minifilter driver for transparent file stubbing and rehydration
+- **LucidLink Audit Log Monitoring** - Automated parsing of `.lucid_audit` folders for real-time last accessed timestamp updates
 - **Windows File Share Backend** - Simple, cost-effective storage using dedicated shares per customer
 - **Automated Tiering Engine** - Rule-based file system scanning and tiering execution
 - **Rehydration System** - On-demand and automated file restoration with per-customer policies
@@ -34,6 +35,20 @@ This solution enables policy-driven data lifecycle management with comprehensive
 - Language: Go or Rust
 - Driver: EaseFilter minifilter (Windows)
 - Storage: Windows File Shares (SMB/CIFS)
+
+## LucidLink Integration
+
+The system includes specialized support for LucidLink volumes:
+
+### Initial Target Discovery
+- First-time targets are scanned using standard CSV/Parquet import methods
+- Complete file inventory with metadata (path, size, timestamps) is captured
+
+### Ongoing Last Accessed Timestamp Updates
+- **Audit Log Location**: `.lucid_audit` folder at the root of each LucidLink volume
+- **Active File Monitoring**: Agent scans all subfolders within `.lucid_audit` for files with `.active` extension
+- **Automated Processing**: Parser continuously monitors and updates last accessed timestamps based on audit log entries
+- **Real-time Updates**: Changes are processed incrementally without requiring full filesystem rescans
 
 ## Project Status
 

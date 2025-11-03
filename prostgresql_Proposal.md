@@ -247,10 +247,20 @@ CREATE POLICY p_audit ON audit_log USING (tenant_id = current_tenant());
 
 **6.1 Agent → API**
 
+**Initial Full Scan (First Time):**
 - Agents enumerate metadata (read-only).
 - Write **newline-delimited CSV** (or Parquet) to local temp, then upload to your API endpoint with headers:
   - X-Tenant-Code, X-Scan-Started, X-Share-Name, X-Source-Type
 - Agent retries with **exponential backoff**, includes **idempotency key** (scan_guid + chunk_seq).
+
+**LucidLink Ongoing Updates (After Initial Scan):**
+- Agent monitors `.lucid_audit` folder at root of LucidLink volume
+- Scans all subfolders for files with `.active` extension
+- Parses audit log entries to extract file access events
+- Batch timestamp updates and upload to API endpoint `/api/v1/audit-updates` with headers:
+  - X-Tenant-Code, X-Volume-ID, X-Source-Type: 'lucidlink_audit'
+- Payload contains: file_path, new_last_accessed timestamp, audit_file reference
+- Idempotency via (tenant_id, volume_id, audit_event_id)
 
 **6.2 API → Postgres staging**
 
@@ -292,6 +302,42 @@ primary key (tenant_id, scan_id, chunk_id)
 
 );
 
+\-- LucidLink audit update staging
+
+CREATE TABLE staging_lucid_audit (
+
+tenant_id uuid NOT NULL,
+
+volume_id text NOT NULL,
+
+file_path text NOT NULL,
+
+new_last_accessed integer NOT NULL,
+
+audit_file text NOT NULL,
+
+audit_event_id text,
+
+processed_utc timestamptz
+
+) WITH (autovacuum_enabled = true);
+
+\-- Audit event idempotency (prevent duplicate processing)
+
+CREATE TABLE lucid_audit_processed (
+
+tenant_id uuid NOT NULL,
+
+volume_id text NOT NULL,
+
+audit_event_id text NOT NULL,
+
+processed_utc timestamptz NOT NULL DEFAULT now(),
+
+primary key (tenant_id, volume_id, audit_event_id)
+
+);
+
 - If (tenant_id, scan_id, chunk_id) exists → **skip** (exactly-once semantics).
 
 **6.3 Normalize + upsert (ingest worker)**
@@ -324,6 +370,64 @@ ON CONFLICT (scan_id, dir_id, name) DO NOTHING;
 
 - Mark chunk complete; optionally **truncate** that chunk from staging.
 - When all chunks complete, set scan.status='OK' and finished_utc=now().
+
+**6.4 LucidLink audit update processing (ongoing)**
+
+- **Step 1: Check idempotency**
+
+SELECT audit_event_id FROM lucid_audit_processed
+
+WHERE tenant_id = ? AND volume_id = ? AND audit_event_id = ANY(?);
+
+- Skip already-processed events.
+
+- **Step 2: Update last_accessed timestamps**
+
+UPDATE file f
+
+SET atime_unix = s.new_last_accessed,
+
+    updated_utc = now()
+
+FROM staging_lucid_audit s
+
+JOIN dir d ON d.tenant_id = s.tenant_id 
+
+          AND d.dir_path = substring(s.file_path from 1 for position('\\' in reverse(s.file_path)))
+
+WHERE f.tenant_id = s.tenant_id
+
+AND f.dir_id = d.dir_id
+
+AND f.name = substring(s.file_path from position('\\' in reverse(s.file_path)) + 1)
+
+AND s.new_last_accessed > f.atime_unix; -- Only update if newer
+
+- **Step 3: Log to audit trail**
+
+INSERT INTO audit_log (tenant_id, actor, action, details_json)
+
+SELECT tenant_id, 'LucidLinkAuditParser', 'timestamp_update',
+
+       jsonb_build_object('file_path', file_path, 'new_atime', new_last_accessed, 'source', 'lucidlink_audit')
+
+FROM staging_lucid_audit;
+
+- **Step 4: Mark events processed**
+
+INSERT INTO lucid_audit_processed (tenant_id, volume_id, audit_event_id)
+
+SELECT DISTINCT tenant_id, volume_id, audit_event_id
+
+FROM staging_lucid_audit
+
+WHERE audit_event_id IS NOT NULL
+
+ON CONFLICT DO NOTHING;
+
+- **Step 5: Trigger planner re-evaluation (optional)**
+
+If updated files were previously in 'PLANNED' or 'STUBBED' state, check if they should be excluded from tiering or rehydrated.
 
 **Concurrency**
 
@@ -516,11 +620,22 @@ AND l.full_path IS NULL;
 
 **12) Windows agent notes (practical)**
 
+**Initial Scan:**
 - **Enumeration**: PowerShell 7 or .NET 8 worker; long-path aware (\\\\?\\), retries, skip errors.
 - **Output**: CSV columns: dir_path,name,size_bytes,atime_unix,mtime_unix,ctime_unix.
 - **Upload**: chunk 250-500k rows; gzip; include chunk_id.
 - **Resilience**: local queue dir with .ok markers; resume after reboot.
 - **Time**: collect UTC; don't format dates in the pipeline.
+
+**LucidLink Audit Monitoring:**
+- **Discovery**: Locate `.lucid_audit` folder at volume root (e.g., `Z:\.lucid_audit`)
+- **Scanning**: Recursively scan all subfolders for files with `.active` extension
+- **Parsing**: Custom parser for LucidLink audit format; extract file_path, access_time, event_id
+- **Batching**: Group updates by volume; batch up to 10k updates per upload
+- **Frequency**: Poll every 5 minutes (configurable); track last processed position per audit file
+- **Deduplication**: Use audit_event_id to prevent reprocessing same events
+- **Error Handling**: Skip corrupted/unparseable entries; log warnings; continue processing
+- **State Tracking**: Maintain cursor file tracking last processed audit file + position
 
 **13) Rollout plan (phased)**
 

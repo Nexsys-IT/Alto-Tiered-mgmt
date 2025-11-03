@@ -66,7 +66,9 @@ flowchart TD
 
 ## Filesystem Scan to Tiering Execution Flow
 
-### Step-by-Step Process: Full Scan CSV Processing
+### Step-by-Step Process: Initial Full Scan CSV Processing
+
+**Note**: This process is used for the **first-time scan** of a target. For LucidLink volumes, subsequent last accessed timestamp updates are handled via audit log monitoring (see LucidLink Audit Log Processing section below).
 
 ```mermaid
 flowchart TD
@@ -212,3 +214,137 @@ Metrics tracked at each stage:
 - Tiering success/failure rates
 - Storage space saved
 - Agent health and connectivity
+
+---
+
+## LucidLink Audit Log Processing Flow
+
+### Overview
+
+For LucidLink volumes, after the initial full scan, the system monitors audit logs to capture real-time last accessed timestamp updates without requiring full filesystem rescans.
+
+### Step-by-Step Process: Audit Log Monitoring
+
+```mermaid
+flowchart TD
+    Start([Agent Monitoring Cycle]) --> LocateRoot[Agent: Locate LucidLink Volume Root]
+    LocateRoot --> FindAudit[Agent: Find .lucid_audit Folder]
+    FindAudit --> ScanSubfolders[Agent: Scan All Subfolders<br/>in .lucid_audit]
+    
+    ScanSubfolders --> FindActive{Find Files with<br/>.active Extension}
+    FindActive -->|Files Found| ParseActive[Agent: Parse .active Files<br/>Extract file access events]
+    FindActive -->|No Files| Wait[Wait for Next Cycle]
+    
+    ParseActive --> ExtractData[Agent: Extract Data<br/>- File path<br/>- Last accessed timestamp<br/>- Access type]
+    ExtractData --> Batch[Agent: Batch Updates<br/>Group by volume/share]
+    
+    Batch --> UploadUpdates[Agent: Upload to API<br/>POST /api/v1/audit-updates]
+    
+    UploadUpdates --> ValidateAPI{API: Validate<br/>- Auth token<br/>- Customer ID<br/>- Volume ID}
+    ValidateAPI -->|Invalid| RejectUpdate[Return 400/401 Error]
+    ValidateAPI -->|Valid| StageUpdate[API: Stage Updates to<br/>Postgres Staging]
+    
+    StageUpdate --> QueueUpdate[API: Queue Update Job<br/>to Message Queue]
+    QueueUpdate --> UpdateWorker[Update Worker: Pick Job]
+    
+    UpdateWorker --> LookupFiles[Worker: Lookup Files<br/>in file_inventory table]
+    LookupFiles --> UpdateTimestamps[Worker: UPDATE<br/>last_accessed timestamps]
+    
+    UpdateTimestamps --> AuditLogEntry[Write Audit Log Entry<br/>Timestamp update source: LucidLink]
+    AuditLogEntry --> NotifyMetrics[Update Metrics<br/>Files processed, update latency]
+    
+    NotifyMetrics --> TriggerReevaluation{Should Re-evaluate<br/>Tiering Rules?}
+    TriggerReevaluation -->|Yes| TriggerPlanner[Trigger Planner Service<br/>Check if files no longer qualify]
+    TriggerReevaluation -->|No| Complete[Update Complete]
+    
+    TriggerPlanner --> Complete
+    Complete --> Wait
+    RejectUpdate --> Wait
+    Wait --> Start
+```
+
+### LucidLink Audit Log Details
+
+#### 1. **Audit Log Structure**
+- **Location**: `<LucidLink Volume Root>\.lucid_audit\`
+- **Subfolders**: Multiple subfolders containing audit files
+- **File Pattern**: Files with `.active` extension contain current/recent access events
+- **Format**: Proprietary LucidLink format (requires custom parser)
+
+#### 2. **Monitoring Strategy**
+- **Polling Interval**: Configurable (default: every 5 minutes)
+- **Incremental Processing**: Track last processed position/timestamp per file
+- **Deduplication**: Ignore already-processed events using event IDs or timestamps
+- **Error Handling**: Skip corrupted files, log errors, continue with next file
+
+#### 3. **Update Batch Format** (Agent to API)
+```json
+{
+  "update_batch_id": "uuid",
+  "customer_id": "uuid",
+  "volume_id": "uuid",
+  "source_type": "lucidlink_audit",
+  "collected_at": "2025-11-03T01:20:00Z",
+  "updates": [
+    {
+      "file_path": "C:\\LucidVolume\\Data\\docs\\report.pdf",
+      "last_accessed": "2025-11-02T18:45:23Z",
+      "access_type": "read",
+      "audit_file": ".lucid_audit\\subfolder\\audit_20251102.active"
+    }
+  ]
+}
+```
+
+#### 4. **Database Update Logic**
+```sql
+-- Update last_accessed for matched files
+UPDATE file_inventory fi
+SET 
+  last_accessed = u.new_last_accessed,
+  updated_at = now(),
+  update_source = 'lucidlink_audit'
+FROM audit_updates_staging u
+WHERE 
+  fi.customer_id = u.customer_id
+  AND fi.file_path = u.file_path
+  AND u.new_last_accessed > fi.last_accessed; -- Only update if newer
+```
+
+#### 5. **Re-evaluation Triggers**
+After updating last accessed timestamps:
+- **Check Eligibility**: If previously planned/stubbed files now have recent access
+- **Update Tiering State**: Mark files as "warmed" if accessed within retention period
+- **Rehydration Priority**: Automatically trigger rehydration for accessed stub files
+- **Rule Re-evaluation**: Re-run planner for files that may no longer qualify for tiering
+
+#### 6. **Performance Considerations**
+- **Batch Size**: Process up to 10,000 updates per batch
+- **Async Processing**: Update worker processes batches asynchronously
+- **Index Optimization**: Ensure `file_path` is indexed for fast lookups
+- **Rate Limiting**: Throttle audit log polling to avoid overwhelming LucidLink volumes
+- **Monitoring**: Track audit log processing lag and update latency
+
+#### 7. **Error Handling & Recovery**
+- **Missing Files**: Log warning if audit log references unknown file paths
+- **Parse Errors**: Skip malformed audit entries, continue processing
+- **Network Issues**: Retry with exponential backoff
+- **Audit Log Rotation**: Handle log file rollover/archival gracefully
+- **Duplicate Detection**: Use audit event IDs to prevent duplicate updates
+
+#### 8. **Integration with Existing Workflows**
+
+**Initial Scan vs. Audit Log Updates**:
+- **First Time**: Full CSV/Parquet scan captures complete inventory
+- **Ongoing**: Audit log monitoring updates only `last_accessed` timestamps
+- **Hybrid Mode**: Periodic full scans (monthly) + continuous audit log monitoring
+
+**Tiering Rule Impact**:
+- Rules based on `last_accessed` are automatically re-evaluated
+- Files with updated access times may be excluded from tiering
+- Already-stubbed files with recent access may trigger rehydration alerts
+
+**Audit Trail**:
+- All timestamp updates logged with source: `lucidlink_audit`
+- Maintains full history of access pattern changes
+- Enables compliance reporting and access analytics

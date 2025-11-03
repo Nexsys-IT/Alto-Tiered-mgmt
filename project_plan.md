@@ -79,7 +79,8 @@ A centralized web-based management solution for automated file tiering and stubb
 **Responsibilities:**
 - Heartbeat and health reporting
 - Configuration synchronization
-- File system scanning
+- File system scanning (initial full scan)
+- LucidLink audit log monitoring (ongoing last accessed updates)
 - Tiering execution
 - Rehydration handling
 - Local event logging
@@ -184,10 +185,11 @@ A centralized web-based management solution for automated file tiering and stubb
 ### 4.2 File System Scanning
 
 **Scan Types:**
-- Full scan (complete file system traversal)
+- Full scan (complete file system traversal) - used for initial discovery
 - Incremental scan (changed files only)
 - Targeted scan (specific paths)
 - Change journal monitoring (real-time)
+- **LucidLink audit log monitoring** - specialized monitoring for LucidLink volumes
 
 **Optimization:**
 - Multi-threaded scanning
@@ -200,6 +202,21 @@ A centralized web-based management solution for automated file tiering and stubb
 - Estimated space savings
 - Estimated operation time
 - Conflict warnings
+
+**LucidLink Audit Log Monitoring:**
+- **Purpose**: Capture real-time last accessed timestamp updates without full rescans
+- **Location**: `.lucid_audit` folder at root of each LucidLink volume
+- **Target Files**: All files with `.active` extension in `.lucid_audit` subfolders
+- **Processing**:
+  - Continuous monitoring with configurable polling interval
+  - Parse audit log entries to extract file access events
+  - Batch timestamp updates and send to API
+  - Update `last_accessed` field in central database
+- **Integration**:
+  - Initial scan uses standard CSV/Parquet method
+  - Subsequent updates via audit log parsing only
+  - Hybrid approach: Monthly full scans + continuous audit monitoring
+- **Rule Re-evaluation**: Trigger planner when timestamp updates affect tiering eligibility
 
 ### 4.3 Tiering/Stubbing Process
 
@@ -595,6 +612,7 @@ A centralized web-based management solution for automated file tiering and stubb
 **Objectives:**
 - Develop host agent application
 - Implement file system scanning
+- **Implement LucidLink audit log monitoring**
 - Create tiering engine
 - Build rehydration system
 
@@ -603,15 +621,20 @@ A centralized web-based management solution for automated file tiering and stubb
 - Installer packages
 - Agent configuration system
 - Communication protocol with central server
+- **LucidLink audit log parser module**
 
 **Key Activities:**
 - Agent-server communication (gRPC)
 - File system scanning logic
+- **LucidLink `.lucid_audit` folder discovery and monitoring**
+- **Parser for `.active` file format**
+- **Timestamp update batching and upload**
 - Tiering workflow implementation
 - Stub creation and management
 - Rehydration logic
 - Local error handling and retry
 - Agent testing on target platforms
+- **Testing with LucidLink test volumes**
 
 ### Phase 5: EaseFilter Driver Configuration Management (Weeks 13-16)
 
